@@ -1,15 +1,9 @@
 """
-拉回買示範程式（鴻海 2317.TW）
-- 指標：SMA20, SMA50, SMA200, RSI14, MACD(12,26,9), 20日平均量
-- 拉回買邏輯（預設）：
-  1) 長期趨勢為多頭：SMA50 > SMA200 且 價格 > SMA50
-  2) 發生短期拉回：今日收盤或最低價低於 SMA20 或 距離最近 N 日高點下跌 >= pullback_pct
-  3) RSI 在 30~50 並有回升跡象（或穿越 30/40）
-  4) MACD 多頭或 histogram 開始回升
-  5) 成交量在拉回底部時不過度放大（反而期待回升時量能跟上）——這邊要求今天量 >= 0.8 * 20日均量（可調）
-  若以上多數條件成立，視為「合格拉回買」，並給出建議進場區間與停損位置
+拉回買示範程式（鴻海 2317.TW）- 修正版
+注意：
+- pip install yfinance pandas numpy
+- python pullback_entry_fixed.py
 """
-
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -27,6 +21,9 @@ VOL_SMA = 20
 PULLBACK_NDAYS = 10        # 最近高點參考天數
 PULLBACK_PCT = 0.07        # 下跌 >= 7% 視為拉回
 VOL_MIN_RATIO = 0.8        # 今天量 >= VOL_MIN_RATIO * 20日均量 -> 視為量能可接受
+
+# 停損 buffer（已移到全域，避免 NameError）
+SL_BUFFER_PCT = 0.015      # 停損建議比最近低點再下方 1.5%
 
 def fetch_data(ticker, days):
     df = yf.Ticker(ticker).history(period=f"{days}d")
@@ -90,20 +87,20 @@ def decision_pullback(df):
     # 最近 N 日高低
     recent_high = df['High'].iloc[-PULLBACK_NDAYS:].max()
     recent_low = df['Low'].iloc[-PULLBACK_NDAYS:].min()
-    drop_from_high = (recent_high - low) / recent_high if recent_high>0 else 0.0
+    drop_from_high = (recent_high - low) / recent_high if (recent_high and recent_high>0) else 0.0
 
     reasons = []
     entry = False
 
     # 1) 長期趨勢：SMA50 > SMA200 且 價格 > SMA50
-    long_trend = (sma50 is not None and sma200 is not None and sma50 > sma200) and (close > sma50)
+    long_trend = (not pd.isna(sma50) and not pd.isna(sma200) and sma50 > sma200) and (close > sma50)
     if long_trend:
         reasons.append("長期趨勢為多頭（SMA50 > SMA200 且 價格 > SMA50）")
     else:
         reasons.append("長期趨勢非典型多頭（SMA50 <= SMA200 或 價格 <= SMA50）")
 
     # 2) 是否處於拉回：低於 SMA20 或 距離最近高點下跌達門檻
-    pullback_by_sma20 = low <= sma20 if not pd.isna(sma20) else False
+    pullback_by_sma20 = (not pd.isna(sma20)) and (low <= sma20)
     pullback_by_pct = drop_from_high >= PULLBACK_PCT
     if pullback_by_sma20:
         reasons.append(f"發生拉回：價格觸及或跌破 SMA{SMA_SHORT}（Low {low:.2f} <= SMA{SMA_SHORT} {sma20:.2f}）")
@@ -129,7 +126,7 @@ def decision_pullback(df):
     else:
         reasons.append("MACD 動能尚未明顯回復")
 
-    # 5) 成交量：今天量不過小（避免成交量完全萎縮）; 同時拉回底部最好量縮，反彈量增 -- 這裡簡化為今日量 >= VOL_MIN_RATIO * 20日均量
+    # 5) 成交量：今天量不過小（避免成交量完全萎縮）
     vol_ok = (not pd.isna(vol20)) and (vol >= VOL_MIN_RATIO * vol20)
     if vol_ok:
         reasons.append(f"今日量 {int(vol)} >= {VOL_MIN_RATIO} * 20日均量 ({int(vol20)})，量能可接受")
@@ -143,21 +140,18 @@ def decision_pullback(df):
         entry = False
 
     # 建議進場區間（保守）：介於今日收盤和最近低點到 SMA20 之間，或直接建議以突破當日高點買進
-    # 這裡給兩種選項供參考
     buy_zone = None
     buy_break = None
     stop_loss = None
-    # 建議停損：最近 N 日低點下方一定比例（例如 1.5%）或跌破 SMA50
-    SL_BUFFER_PCT = 0.015
+
     if pullback_by_sma20 and not pd.isna(sma20):
-        buy_zone = (max(low, sma20*0.98), max(close, sma20))  # 保守：0.98*sma20 ~ sma20 ~ close
+        buy_zone = (max(low, sma20*0.98), max(close, sma20))
         stop_loss = recent_low * (1 - SL_BUFFER_PCT)
     elif pullback_by_pct:
-        buy_zone = (recent_low, (recent_high + recent_low)/2)  # 用最近低點到中間價做參考
+        buy_zone = (recent_low, (recent_high + recent_low)/2)
         stop_loss = recent_low * (1 - SL_BUFFER_PCT)
     else:
-        # 非拉回，可使用突破買法（可選）
-        buy_break = latest['High'] * 1.002  # 若想用突破買進
+        buy_break = latest['High'] * 1.002
         stop_loss = recent_low * (1 - SL_BUFFER_PCT)
 
     return {
@@ -183,14 +177,15 @@ def decision_pullback(df):
         "plan": {
             "buy_zone": buy_zone,
             "buy_break": buy_break,
-            "stop_loss": stop_loss
+            "stop_loss": stop_loss,
+            "sl_buffer_pct": SL_BUFFER_PCT
         }
     }
 
 def pretty_print(res):
     vals = res["values"]
     plan = res["plan"]
-    print("=== 鴻海 (2317.TW) — 拉回買判斷 ===")
+    print("=== 鴻海 (2317.TW) — 拉回買判斷（修正版） ===")
     print("時間：", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     print(f"今日收盤：{vals['close']:.2f}    今日最低：{vals['low']:.2f}    今日成交量：{int(vals['volume'])}")
     print(f"SMA{SMA_SHORT}：{vals['SMA20']:.2f}    SMA{SMA_MID}：{vals['SMA50']:.2f}    SMA{SMA_LONG}：{vals['SMA200']:.2f}")
@@ -211,7 +206,7 @@ def pretty_print(res):
     if plan["buy_break"] is not None:
         print(f" - 或等突破買進（突破當日高點）買點：{plan['buy_break']:.2f}")
     if plan["stop_loss"] is not None:
-        print(f" - 建議停損：{plan['stop_loss']:.2f}（例如最近 {PULLBACK_NDAYS} 日低點下方 {SL_BUFFER_PCT*100:.2f}%）")
+        print(f" - 建議停損：{plan['stop_loss']:.2f}（例如最近 {PULLBACK_NDAYS} 日低點下方 {plan.get('sl_buffer_pct', SL_BUFFER_PCT)*100:.2f}%）")
     print("\n提示：可調整參數包括：PULLBACK_PCT、PULLBACK_NDAYS、VOL_MIN_RATIO、RSI 閾值等。")
 
 def main():
